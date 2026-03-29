@@ -1,3 +1,14 @@
+Update 2026.03.29
+-----------------
+I (Wowfunhappy) needed to insert a dylib into a binary (Momiji) that did not have any free space for more dylibs. I asked Claude to make this possible, and also to write and run tests for itself. After a few rounds of back and forth, Claude produced something which appeared to work.
+
+The correctness of this feature has not been verified beyond (1) it passes Claude's own tests and (2) it works with Momiji.
+
+Snow Leopard support was also added, because why not. This is entirely untested.
+
+
+-----
+
 insert_dylib
 ============
 
