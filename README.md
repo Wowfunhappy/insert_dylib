@@ -4,7 +4,7 @@ I (Wowfunhappy) needed to insert a dylib into a binary (Momiji) that did not hav
 
 The correctness of this feature has not been verified beyond (1) it passes Claude's own tests and (2) it works with Momiji.
 
-Snow Leopard support was also added, because why not. This is entirely untested.
+Snow Leopard support was also added.
 
 
 -----
