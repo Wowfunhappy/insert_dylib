@@ -1,10 +1,11 @@
 #!/bin/bash
-# Tests for fixes 5-9:
+# Tests for fixes 5-10:
 #   5: Large export trie (>4096 nodes)
 #   6: Missing LC handlers (LC_DYLIB_CODE_SIGN_DRS etc)
 #   7: Shadow header ncmds/sizeofcmds zeroed
 #   8: Fall-through bug in check_load_commands
 #   9: False positive pointer scan eliminated
+#  10: Shadow headers do not overwrite large load-command tables
 TOOL="./insert_dylib_new"
 TESTDIR=$(mktemp -d -t test_fixes)
 PASS=0
@@ -202,6 +203,33 @@ echo "Output: $OUTPUT"
 check "4GB constant NOT corrupted after expansion" "$(echo "$OUTPUT" | grep -c 'CONSTANT_INTACT')"
 check "_NSGetMachExecuteHeader still valid" "$(echo "$OUTPUT" | grep -c 'MH_VALID')"
 check "False positive test runs to completion" "$(echo "$OUTPUT" | grep -c 'FALSE_POS_OK')"
+
+# ==========================================================================
+echo ""
+echo "=== Fix 10: Large load-command table remains intact ==="
+# Triangle Run has more than one page of load commands.  The old shadow-header
+# code wrote at 0x1000 after every insertion and corrupted a command there even
+# when no header expansion occurred.
+cat > "$TESTDIR/large_lc.c" << 'EOF'
+int main(void) { return 0; }
+EOF
+
+RPATH_ARGS=()
+for i in $(seq 1 80); do
+    RPATH_ARGS+=("-Wl,-rpath,/tmp/insert_dylib_test_path_${i}_aaaaaaaaaaaaaaaa")
+done
+cc -o "$TESTDIR/large_lc" "$TESTDIR/large_lc.c" "${RPATH_ARGS[@]}" -Wl,-headerpad,0x1000
+
+ORIG_NCMDS=$(otool -hv "$TESTDIR/large_lc" | tail -1 | awk '{for(i=1;i<=NF;i++) if($i == "EXECUTE") print $(i+1)}')
+cp "$TESTDIR/large_lc" "$TESTDIR/large_lc_patched"
+$TOOL --all-yes --inplace /usr/lib/libz.dylib "$TESTDIR/large_lc_patched" > /dev/null 2>&1
+
+OTOOL_OUTPUT=$(otool -L "$TESTDIR/large_lc_patched" 2>&1)
+OTOOL_STATUS=$?
+NEW_NCMDS=$(otool -hv "$TESTDIR/large_lc_patched" | tail -1 | awk '{for(i=1;i<=NF;i++) if($i == "EXECUTE") print $(i+1)}')
+check "otool accepts the patched load-command table" "$([ "$OTOOL_STATUS" -eq 0 ] && echo 1 || echo 0)"
+check "All existing load commands plus the dylib command remain" "$([ "$NEW_NCMDS" -eq $((ORIG_NCMDS + 1)) ] && echo 1 || echo 0)"
+check "Inserted dylib is readable after the large command table" "$(echo "$OTOOL_OUTPUT" | grep -c '/usr/lib/libz.dylib')"
 
 # ==========================================================================
 echo ""

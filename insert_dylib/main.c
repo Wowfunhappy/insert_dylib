@@ -333,6 +333,12 @@ bool check_load_commands(FILE *f, struct mach_header *mh, size_t header_offset, 
 }
 
 // --- Export trie rebuilder ---
+// dyld4-era section type: 4-byte initializer offsets from the image base,
+// replacing the absolute pointers of S_MOD_INIT_FUNC_POINTERS.
+#ifndef S_INIT_FUNC_OFFSETS
+#define S_INIT_FUNC_OFFSETS 0x16
+#endif
+
 // The export trie encodes symbol addresses as offsets from the image base
 // (__TEXT vmaddr). When we change __TEXT vmaddr, these offsets must be updated.
 
@@ -540,7 +546,12 @@ bool make_room_for_load_commands(FILE *f, size_t header_offset, struct mach_head
 	if(available >= space_needed) return true;
 
 	uint32_t shift = 0x1000;
-	while(available + shift < space_needed) shift += 0x1000;
+	// A shadow header is placed at this offset after expansion so references
+	// to the original image base remain valid.  Keep that page beyond the
+	// enlarged load-command table; otherwise the shadow itself corrupts a
+	// load command in binaries whose table already spans one or more pages.
+	uint32_t first_safe_shadow = (uint32_t)ROUND_UP(hdr_size + sizeofcmds + space_needed, 0x1000) + 0x1000;
+	while(available + shift < space_needed || shift < first_safe_shadow) shift += 0x1000;
 
 	// Verify __PAGEZERO exists and can be shrunk
 	bool found_pagezero = false;
@@ -775,6 +786,37 @@ bool make_room_for_load_commands(FILE *f, size_t header_offset, struct mach_head
 			free(sc);
 		} else if(cmd == LC_SEGMENT_64) {
 			struct segment_command_64 *seg = read_load_command(f, cs);
+
+			// S_INIT_FUNC_OFFSETS holds 4-byte static-constructor offsets from
+			// the image base -- the same class of value as the export trie
+			// addresses above. Lowering __TEXT's vmaddr leaves the constructors
+			// where they are, so every entry must gain `shift`; otherwise dyld
+			// calls (base - shift) + offset and jumps into whatever precedes the
+			// real constructor. Section offsets were already shifted, so these
+			// read from the post-shift location.
+			{
+				uint32_t ns = SWAP32(seg->nsects, magic);
+				struct section_64 *ss = (struct section_64 *)((char *)seg + sizeof(struct segment_command_64));
+				for(uint32_t j = 0; j < ns; j++) {
+					if((SWAP32(ss[j].flags, magic) & SECTION_TYPE) != S_INIT_FUNC_OFFSETS) continue;
+					uint32_t so = SWAP32(ss[j].offset, magic);
+					uint32_t sz = (uint32_t)SWAP64(ss[j].size, magic);
+					if(sz == 0 || sz % 4 != 0) continue;
+					uint32_t n = sz / 4;
+					uint32_t *ents = malloc(sz);
+					if(!ents) continue;
+					fseeko(f, header_offset + so, SEEK_SET);
+					if(fread(ents, sz, 1, f) == 1) {
+						for(uint32_t k = 0; k < n; k++)
+							ents[k] = SWAP32(SWAP32(ents[k], magic) + shift, magic);
+						fseeko(f, header_offset + so, SEEK_SET);
+						fwrite(ents, sz, 1, f);
+						printf("Adjusted %u __init_offsets entries by 0x%x.\n", n, shift);
+					}
+					free(ents);
+				}
+			}
+
 			if(strcmp(seg->segname, "__LINKEDIT") == 0) {
 				linkedit_fileoff_val = (uint32_t)SWAP64(seg->fileoff, magic);
 				linkedit_filesize_val = (uint32_t)SWAP64(seg->filesize, magic);
@@ -960,6 +1002,7 @@ bool insert_dylib(FILE *f, size_t header_offset, const char *dylib_path, off_t *
 	};
 
 	uint32_t sizeofcmds = SWAP32(mh.sizeofcmds, mh.magic);
+	bool expanded_header = false;
 
 	fseeko(f, commands_offset + sizeofcmds, SEEK_SET);
 	char space[cmdsize];
@@ -975,7 +1018,9 @@ bool insert_dylib(FILE *f, size_t header_offset, const char *dylib_path, off_t *
 	}
 
 	if(!empty) {
+		off_t size_before_expansion = *slice_size;
 		if(make_room_for_load_commands(f, header_offset, &mh, cmdsize, slice_size)) {
+			expanded_header = *slice_size > size_before_expansion;
 			// Re-check space after expansion
 			fseeko(f, commands_offset + sizeofcmds, SEEK_SET);
 			fread(&space, cmdsize, 1, f);
@@ -1016,7 +1061,7 @@ bool insert_dylib(FILE *f, size_t header_offset, const char *dylib_path, off_t *
 	// expansion shifts __TEXT vmaddr down, RIP-relative references to
 	// _mh_execute_header baked into the code still point at the old vmaddr.
 	// A shadow copy at that file offset ensures they read a valid header.
-	if(IS_64_BIT(mh.magic)) {
+	if(expanded_header && IS_64_BIT(mh.magic)) {
 		// Find first section offset to know the padding extent
 		uint32_t nc = SWAP32(mh.ncmds, mh.magic);
 		uint32_t first_sect = UINT32_MAX;
@@ -1040,14 +1085,17 @@ bool insert_dylib(FILE *f, size_t header_offset, const char *dylib_path, off_t *
 			fseeko(f, p + cs, SEEK_SET);
 		}
 
-		if(first_sect != UINT32_MAX && first_sect > 0x1000) {
+		uint32_t first_shadow = (uint32_t)ROUND_UP(
+			sizeof(struct mach_header_64) + SWAP32(mh.sizeofcmds, mh.magic),
+			0x1000);
+		if(first_sect != UINT32_MAX && first_sect >= first_shadow + 32) {
 			uint8_t hdr_shadow[32]; // sizeof(mach_header_64)
 			fseeko(f, header_offset, SEEK_SET);
 			fread(hdr_shadow, sizeof(hdr_shadow), 1, f);
 			// Zero ncmds(offset 16) and sizeofcmds(offset 20) so code
 			// won't try to walk non-existent load commands from the shadow
 			memset(hdr_shadow + 16, 0, 8);
-			for(uint32_t off = 0x1000; off + 32 <= first_sect; off += 0x1000) {
+			for(uint32_t off = first_shadow; off + 32 <= first_sect; off += 0x1000) {
 				fseeko(f, header_offset + off, SEEK_SET);
 				fwrite(hdr_shadow, sizeof(hdr_shadow), 1, f);
 			}
